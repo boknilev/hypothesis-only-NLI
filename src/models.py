@@ -2,7 +2,7 @@ import numpy as np
 import time
 
 import torch
-from torch.autograd import Variable
+from torch.autograd import Variable, Function
 import torch.nn as nn
 
 """
@@ -24,7 +24,7 @@ class BLSTMEncoder(nn.Module):
 
     def is_cuda(self):
         # either all weights are on cpu or they are on gpu
-        return 'cuda' in str(type(self.enc_lstm.bias_hh_l0.data))
+        return 'cuda' in str(self.enc_lstm.bias_hh_l0.device)
 
     def forward(self, sent_tuple):
         # sent_len: [max_len, ..., min_len] (bsize)
@@ -246,6 +246,64 @@ class BLSTMEncoder(nn.Module):
 
         return output, idxs
 
+
+
+
+"""
+Main module for Natural Language Inference
+"""
+
+
+class NLINet(nn.Module):
+    def __init__(self, config):
+        super(NLINet, self).__init__()
+
+        # classifier
+        self.nonlinear_fc = config['nonlinear_fc']
+        self.fc_dim = config['fc_dim']
+        self.n_classes = config['n_classes']
+        self.enc_lstm_dim = config['enc_lstm_dim']
+        self.encoder_type = config['encoder_type']
+        self.dpout_fc = config['dpout_fc']
+
+        self.encoder = eval(self.encoder_type)(config)
+        self.inputdim = 4*2*self.enc_lstm_dim
+        self.inputdim = 4*self.inputdim if self.encoder_type in \
+                        ["ConvNetEncoder", "InnerAttentionMILAEncoder"] else self.inputdim
+        self.inputdim = self.inputdim/2 if self.encoder_type == "LSTMEncoder" \
+                                        else self.inputdim
+        if self.nonlinear_fc:
+            self.classifier = nn.Sequential(
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.inputdim, self.fc_dim),
+                nn.Tanh(),
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.fc_dim, self.fc_dim),
+                nn.Tanh(),
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.fc_dim, self.n_classes),
+                )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(self.inputdim, self.fc_dim),
+                nn.Linear(self.fc_dim, self.fc_dim),
+                nn.Linear(self.fc_dim, self.n_classes)
+                )
+
+    def forward(self, s1, s2):
+        # s1 : (s1, s1_len)
+        u = self.encoder(s1)
+        v = self.encoder(s2)
+
+        features = torch.cat((u, v, torch.abs(u-v), u*v), 1)
+        output = self.classifier(features)
+        return output
+
+    def encode(self, s1):
+        emb = self.encoder(s1)
+        return emb
+
+
 """
 Main module for Natural Language Inference
 """
@@ -256,7 +314,7 @@ class NLI_HYPOTHS_Net(nn.Module):
         # classifier
         self.nonlinear_fc = config['nonlinear_fc']
         self.fc_dim = config['fc_dim']
-        self.n_classes = 3
+        self.n_classes = config['n_classes']
         self.enc_lstm_dim = config['enc_lstm_dim']
         self.encoder_type = config['encoder_type']
         self.dpout_fc = config['dpout_fc']
@@ -297,6 +355,145 @@ class NLI_HYPOTHS_Net(nn.Module):
     def encode(self, s1):
         emb = self.encoder(s1)
         return emb
+
+
+"""
+Gradient reversal layer from https://discuss.pytorch.org/t/solved-reverse-gradients-in-backward-pass/3589/6
+TODO: the forward/backward steps should be static methods per Function documentaiton (), but then how to set lambd? 
+"""
+class GradReverse(Function):
+
+    def __init__(self, lambd=1.0):
+        self.lambd = lambd
+
+    def forward(self, x):
+        return x.view_as(x)
+
+    def backward(self, grad_output):
+        return (grad_output * -self.lambd)
+
+def grad_reverse(x, lambd=1.0):
+    return GradReverse(lambd)(x)
+
+
+
+"""
+Module for adversarial encoding 
+"""
+class SharedHypothNet(nn.Module):
+    def __init__(self, config, encoder):
+        super(SharedHypothNet, self).__init__()
+
+        # classifier
+        self.nonlinear_fc = config['nonlinear_fc']
+        self.fc_dim = config['fc_dim']
+        self.n_classes = config['n_classes']
+        self.enc_lstm_dim = config['enc_lstm_dim']
+        self.encoder_type = config['encoder_type']
+        self.dpout_fc = config['dpout_fc']
+        self.adv_hyp_encoder_lambda = config['adv_hyp_encoder_lambda']
+
+        #self.encoder = eval(self.encoder_type)(config)
+        self.encoder = encoder 
+        self.inputdim = 2*self.enc_lstm_dim
+        #self.inputdim = 4*2*self.enc_lstm_dim
+        self.inputdim = 4*self.inputdim if self.encoder_type in \
+                        ["ConvNetEncoder", "InnerAttentionMILAEncoder"] else self.inputdim
+        self.inputdim = self.inputdim/2 if self.encoder_type == "LSTMEncoder" \
+                                        else self.inputdim
+        if self.nonlinear_fc:
+            self.classifier = nn.Sequential(
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.inputdim, self.fc_dim),
+                nn.Tanh(),
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.fc_dim, self.fc_dim),
+                nn.Tanh(),
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.fc_dim, self.n_classes),
+                )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(self.inputdim, self.fc_dim),
+                nn.Linear(self.fc_dim, self.fc_dim),
+                nn.Linear(self.fc_dim, self.n_classes)
+                )
+
+    def forward(self, s2):
+        # s1 : (s1, s1_len)
+        v = self.encoder(s2)
+        # reverse gradients going into the encoder
+        v = grad_reverse(v, self.adv_hyp_encoder_lambda)
+
+        features = v 
+        output = self.classifier(features)
+        return output
+
+    def encode(self, s1):
+        emb = self.encoder(s1)
+        return emb
+
+
+class SharedNLINet(nn.Module):
+    def __init__(self, config, encoder_premise, encoder_hypoth):
+        # Assumes encoder_premise and encoder_hypoth are of same config['encoder_type']
+        super(SharedNLINet, self).__init__()
+
+        # classifier
+        self.nonlinear_fc = config['nonlinear_fc']
+        self.fc_dim = config['fc_dim']
+        self.n_classes = config['n_classes']
+        self.enc_lstm_dim = config['enc_lstm_dim']
+        self.encoder_type = config['encoder_type']
+        self.dpout_fc = config['dpout_fc']
+        self.adv_hyp_encoder_lambda = config['nli_net_adv_hyp_encoder_lambda']
+
+        #self.encoder = eval(self.encoder_type)(config)
+        self.encoder_premise = encoder_premise
+        self.encoder_hypoth = encoder_hypoth
+        self.inputdim = 4*2*self.enc_lstm_dim
+        self.inputdim = 4*self.inputdim if self.encoder_type in \
+                        ["ConvNetEncoder", "InnerAttentionMILAEncoder"] else self.inputdim
+        self.inputdim = self.inputdim/2 if self.encoder_type == "LSTMEncoder" \
+                                        else self.inputdim
+        if self.nonlinear_fc:
+            self.classifier = nn.Sequential(
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.inputdim, self.fc_dim),
+                nn.Tanh(),
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.fc_dim, self.fc_dim),
+                nn.Tanh(),
+                nn.Dropout(p=self.dpout_fc),
+                nn.Linear(self.fc_dim, self.n_classes),
+                )
+        else:
+            self.classifier = nn.Sequential(
+                nn.Linear(self.inputdim, self.fc_dim),
+                nn.Linear(self.fc_dim, self.fc_dim),
+                nn.Linear(self.fc_dim, self.n_classes)
+                )
+
+    def forward(self, s1, s2, random_premise=False):
+        # s1 : (s1, s1_len)
+        u = self.encoder_premise(s1)
+        v = self.encoder_hypoth(s2)
+        if random_premise:
+            # block gradients from back-propagating to the premise encoder 
+            u = grad_reverse(u, 0.0)
+            # reverse gradients when back-propagating to the hypothesis encoder
+            v = grad_reverse(v, self.adv_hyp_encoder_lambda)
+        
+
+        features = torch.cat((u, v, torch.abs(u-v), u*v), 1)
+        output = self.classifier(features)
+        return output
+
+    def encode(self, s1):
+        emb = self.encoder_premise(s1)
+        return emb
+
+
 
 
 """

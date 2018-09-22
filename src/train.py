@@ -54,6 +54,8 @@ def get_args():
   parser.add_argument("--fc_dim", type=int, default=512, help="nhid of fc layers")
   parser.add_argument("--n_classes", type=int, default=3, help="entailment/neutral/contradiction")
   parser.add_argument("--pool_type", type=str, default='max', help="max or mean")
+  parser.add_argument("--pre_trained_nli_model", type=str, default='', help="path to pre-trained NLI model (assumed to have hypoth_encoder module)")
+  parser.add_argument("--freeze_encoder", action="store_true", help="freeze encoder parameters")
 
   # gpu
   parser.add_argument("--gpu_id", type=int, default=-1, help="GPU ID")
@@ -148,7 +150,7 @@ def trainepoch(epoch, train, optimizer, params, word_vec, nli_net, loss_fn):
 
     # loss
     loss = loss_fn(output, tgt_batch)
-    all_costs.append(loss.data[0])
+    all_costs.append(loss.item())
     words_count += hypoths_batch.nelement() / params.word_emb_dim
 
     # backward
@@ -284,6 +286,25 @@ def main(args):
   nli_net = NLI_HYPOTHS_Net(nli_model_configs)
   print(nli_net)
 
+  if args.pre_trained_nli_model:
+     print("Pre_trained_model: " + args.pre_trained_nli_model)
+     from models import SharedNLINet
+     pre_trained_model = torch.load(args.pre_trained_nli_model)
+   
+     nli_net_params = nli_net.state_dict()
+     pre_trained_params = pre_trained_model.state_dict()
+     # this assert will fail becasue pre-trained model has both premise and hypothesis encoders
+     #assert nli_net_params.keys() == pre_trained_params.keys(), "load model has different parameter state names that NLI_HYPOTHS_NET"
+     # instead, we will only copy the hypothesis encoder
+     for key, parameters in nli_net_params.items():
+       if key.startswith('encoder'):
+         pre_trained_key = key.replace('encoder', 'encoder_hypoth')
+         if parameters.size() == pre_trained_params[pre_trained_key].size():
+           nli_net_params[key] = pre_trained_params[pre_trained_key]
+     nli_net.load_state_dict(nli_net_params)
+
+  print(nli_net)
+
   # loss
   weight = torch.FloatTensor(args.n_classes).fill_(1)
   loss_fn = nn.CrossEntropyLoss(weight=weight)
@@ -292,6 +313,11 @@ def main(args):
   # optimizer
   optim_fn, optim_params = get_optimizer(args.optimizer)
   optimizer = optim_fn(nli_net.parameters(), **optim_params)
+
+  if args.freeze_encoder:
+    print("Freezing encoder parameters")
+    for p in nli_net.encoder.parameters():
+      p.requires_grad = False
 
   if args.gpu_id > -1:
     nli_net.cuda()

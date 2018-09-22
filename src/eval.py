@@ -91,7 +91,7 @@ def evaluate(epoch, valid, params, word_vec, nli_net, eval_type, pred_file):
 
     all_preds = output.data.max(1)[1]
     for pred in all_preds:
-      out_preds_f.write(IDX2LBL[pred[0]] + "\n")
+      out_preds_f.write(IDX2LBL[pred.item()] + "\n")
     correct += all_preds.long().eq(tgt_batch.data.long()).cpu().sum()
 
   out_preds_f.close()
